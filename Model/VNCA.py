@@ -1,3 +1,8 @@
+"""
+
+注意是 torch shapeguard 而不是 shapeguard
+"""
+
 import random
 from typing import Sequence, Tuple
 
