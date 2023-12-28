@@ -10,60 +10,78 @@ from torch import optim
 from torch.distributions import Normal, Distribution
 from torch.utils.data import DataLoader, Dataset
 
+from VNCA_ST import logger
 from VNCA_ST.Trainer.dataset import IterableWrapper
 from VNCA_ST.Trainer.loss import elbo, iwae
 from VNCA_ST.Model.NCA import NCA
 from VNCA_ST.Model.base import CAModel
 
-
+from VNCA_ST.Trainer.reporter import get_writer
 
 # torch.autograd.set_detect_anomaly(True)
 
+class VNCA_paras:
+    h: int
+    w: int
+    n_channels: int
+    z_size: int
+    encoder: torch.nn.Module
+    update_net: torch.nn.Module
+    train_data: Dataset
+    val_data: Dataset
+    test_data: Dataset
+    states_to_dist: callable
+    batch_size: int
+    dmg_size: int
+    p_update: float
+    min_steps: int
+    max_steps: int
+
+    # reporter
+    writer:callable = None
+    reporter_type:str = "tensorboard"
+    exp_name:str = "VNCAST_original"
+
+
+
 class VNCA(CAModel):
     def __init__(self,
-                 h: int,
-                 w: int,
-                 n_channels: int,
-                 z_size: int,
-                 encoder: torch.nn.Module,
-                 update_net: torch.nn.Module,
-                 train_data: Dataset,
-                 val_data: Dataset,
-                 test_data: Dataset,
-                 states_to_dist,
-                 batch_size: int,
-                 dmg_size: int,
-                 p_update: float,
-                 min_steps: int,
-                 max_steps: int
+                paras:VNCA_paras,
                  ):
         super(CAModel, self).__init__()
-        self.h = h
-        self.w = w
-        self.n_channels = n_channels
-        self.state_to_dist = states_to_dist
-        self.z_size = z_size
+        self.h = paras.h
+        self.w = paras.w
+        self.n_channels = paras.n_channels
+        self.state_to_dist = paras.states_to_dist
+        self.z_size = paras.z_size
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.pool = []
         self.pool_size = 1024
-        self.n_damage = batch_size // 4
-        self.dmg_size = dmg_size
+        self.n_damage = paras.batch_size // 4
+        self.dmg_size = paras.dmg_size
 
-        self.encoder = encoder
-        self.nca = NCA(update_net, min_steps, max_steps, p_update)
-        self.p_z = Normal(torch.zeros(self.z_size, device=self.device), torch.ones(self.z_size, device=self.device))
+        self.encoder = paras.encoder
+        self.nca = NCA(paras.update_net, paras.min_steps, paras.max_steps, paras.p_update)
+        self.p_z = Normal(torch.zeros(self.z_size, device=self.device), 
+                          torch.ones(self.z_size, device=self.device))
 
-        self.test_set = test_data
-        self.train_loader = iter(DataLoader(IterableWrapper(train_data), batch_size=batch_size, pin_memory=True))
-        self.val_loader = iter(DataLoader(IterableWrapper(val_data), batch_size=batch_size, pin_memory=True))
-        self.train_writer, self.test_writer = get_writers("vnca")
+        self.test_set = paras.test_data
+        self.train_loader = iter(DataLoader(IterableWrapper(paras.train_data), 
+                                            batch_size=paras.batch_size, pin_memory=True))
+        self.val_loader = iter(DataLoader(IterableWrapper(paras.val_data), 
+                                          batch_size=paras.batch_size, pin_memory=True))
 
-        print(self)
+        self.writer = paras.writer if paras.writer is not None \
+                                    else get_writer(paras.reporter_type,
+                                                    self.state_to_dist,
+                                                    paras.exp_name)
+
+        logger.info(self)
         total = sum(p.numel() for p in self.parameters())
         for n, p in self.named_parameters():
-            print(n, p.shape, p.numel(), "%.1f" % (p.numel() / total * 100))
-        print("Total: %d" % total)
+            logger.info(n, p.shape, p.numel(), "%.1f" % (p.numel() / total * 100))
+        logger.info("Total: %d" % total)
 
         self.to(self.device)
         self.optimizer = optim.Adam(self.parameters(), lr=1e-4)
@@ -82,7 +100,7 @@ class VNCA(CAModel):
         self.optimizer.step()
 
         if self.batch_idx % 100 == 0:
-            self.report(self.train_writer, states, loss, recon_loss, kl_loss)
+            self.writer.report_train( states, loss, recon_loss, kl_loss)
 
         self.batch_idx += 1
         return loss.mean().item()
@@ -92,7 +110,7 @@ class VNCA(CAModel):
         with torch.no_grad():
             x, y = next(self.val_loader)
             loss, z, p_x_given_z, recon_loss, kl_loss, states = self.forward(x, 1, iwae)
-            self.report(self.test_writer, states, loss, recon_loss, kl_loss)
+            self.writer.report_test(states, loss, recon_loss, kl_loss)
         return loss.mean().item()
 
     def test(self, n_iw_samples):
@@ -103,11 +121,7 @@ class VNCA(CAModel):
                 loss, z, p_x_given_z, recon_loss, kl_loss, states = self.forward(x, n_iw_samples, iwae)
                 total_loss += loss.mean().item()
 
-        print(total_loss / len(self.test_set))
-
-    def to_rgb(self, state):
-        dist: Distribution = self.state_to_dist(state)
-        return distorch.sample(), distorch.mean
+        logger.info(total_loss / len(self.test_set))
 
     def encode(self, x) -> Distribution:  # q(z|x)
         x.sg("Bchw")
@@ -178,65 +192,3 @@ class VNCA(CAModel):
             self.pool = self.pool[:self.pool_size]
 
         return loss, z, p_x_given_z, recon_loss, kl_loss, states
-
-    def report(self, writer: SummaryWriter, recon_states, loss, recon_loss, kl_loss):
-        writer.add_scalar('loss', loss.mean().item(), self.batch_idx)
-        writer.add_scalar('bpd', loss.mean().item() / (np.log(2) * self.n_channels * self.h * self.w), self.batch_idx)
-        writer.add_scalar('pool_size', len(self.pool), self.batch_idx)
-
-        if recon_loss is not None:
-            writer.add_scalar('recon_loss', recon_loss.mean().item(), self.batch_idx)
-        if kl_loss is not None:
-            writer.add_scalar('kl_loss', kl_loss.mean().item(), self.batch_idx)
-
-        ShapeGuard.reset()
-        with torch.no_grad():
-            # samples
-            samples = self.p_z.sample((8,)).view(8, -1, 1, 1).expand(8, -1, self.h, self.w).to(self.device)
-            states = self.decode(samples)
-            samples, samples_means = self.to_rgb(states[-1])
-            writer.add_images("samples/samples", samples, self.batch_idx)
-            writer.add_images("samples/means", samples_means, self.batch_idx)
-
-            def plot_growth(states, tag):
-                growth_samples = []
-                growth_means = []
-                for state in states:
-                    growth_sample, growth_mean = self.to_rgb(state[0:1])
-                    growth_samples.append(growth_sample)
-                    growth_means.append(growth_mean)
-
-                growth_samples = torch.cat(growth_samples, dim=0).cpu().detach().numpy()  # (n_states, 3, h, w)
-                growth_means = torch.cat(growth_means, dim=0).cpu().detach().numpy()  # (n_states, 3, h, w)
-                writer.add_images(tag + "/samples", growth_samples, self.batch_idx)
-                writer.add_images(tag + "/means", growth_means, self.batch_idx)
-
-            plot_growth(states, "growth")
-
-            # Damage
-            state = states[-1]
-            _, original_means = self.to_rgb(state)
-            writer.add_images("dmg/1-pre", original_means, self.batch_idx)
-            dmg = self.damage(state)
-            _, dmg_means = self.to_rgb(dmg)
-            writer.add_images("dmg/2-dmg", dmg_means, self.batch_idx)
-            recovered = self.nca(dmg)
-            _, recovered_means = self.to_rgb(recovered[-1])
-            writer.add_images("dmg/3-post", recovered_means, self.batch_idx)
-
-            plot_growth(recovered, "recovery")
-
-            # Reconstructions
-            recons_samples, recons_means = self.to_rgb(recon_states[-1].detach())
-            writer.add_images("recons/samples", recons_samples, self.batch_idx)
-            writer.add_images("recons/means", recons_means, self.batch_idx)
-
-            # Pool
-            if len(self.pool) > 0:
-                pool_xs, pool_states, pool_losses = zip(*random.sample(self.pool, min(len(self.pool), 64)))
-                pool_states = torch.stack(pool_states)  # 64, z, h, w
-                pool_samples, pool_means = self.to_rgb(pool_states)
-                writer.add_images("pool/samples", pool_samples, self.batch_idx)
-                writer.add_images("pool/means", pool_means, self.batch_idx)
-
-        writer.flush()

@@ -9,10 +9,10 @@ import torch.nn as nn
 class CAModel(nn.Module):
 
     def train_batch(self) -> float:
-        raise NotImplemented()
+        raise NotImplementedError
 
     def eval_batch(self) -> float:
-        raise NotImplemented()
+        raise NotImplementedError
 
     def save(self, fn):
         torch.save({
